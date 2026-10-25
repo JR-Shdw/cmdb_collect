@@ -1,0 +1,108 @@
+---
+# CMDB — Ansible drift detection
+# Détecte les écarts de configuration et reporte à l'API CMDB
+# Utilise cmdb-collect (lecture sans privilège)
+#
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/check_drift.yml --ask-vault-pass
+# Cron:  0 3 * * * (daily)
+#
+# Checks:
+#   - Services critiques enabled/running
+#   - SSH hardening (PermitRootLogin, PasswordAuthentication)
+#   - Firewall actif (ufw/firewalld)
+
+- name: CMDB — Drift detection
+  hosts: all:!workstation
+  gather_facts: true
+  become: false
+  vars:
+    ansible_user: cmdb-collect
+    ansible_ssh_private_key_file: "~/.ssh/cmdb_collect_ed25519"
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_token: "{{ cmdb_api_token }}"
+    expected_services:
+      - sshd
+      - wazuh-agent
+    expected_ssh:
+      PermitRootLogin: "no"
+      PasswordAuthentication: "no"
+
+  tasks:
+    # ── Service drift ──────────────────────────────────────
+    - name: Check expected services
+      ansible.builtin.shell: |
+        systemctl is-enabled {{ item }} 2>/dev/null && systemctl is-active {{ item }} 2>/dev/null || echo "not_found"
+      register: svc_checks
+      loop: "{{ expected_services }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Build service drift items
+      ansible.builtin.set_fact:
+        drift_services: >-
+          [{% for r in svc_checks.results %}
+          {% if r.stdout | trim != 'enabled\nactive' %}
+          {"drift_type": "service", "resource_name": "{{ r.item }}", "expected": "enabled+active", "actual": "{{ r.stdout | trim | replace('\n', ' ') }}", "severity": "high"},
+          {% endif %}
+          {% endfor %}]
+
+    # ── SSH config drift ───────────────────────────────────
+    - name: Read sshd_config values
+      ansible.builtin.shell: |
+        grep -i "^{{ item.key }}" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "not_set"
+      register: ssh_checks
+      loop: "{{ expected_ssh | dict2items }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Build SSH drift items
+      ansible.builtin.set_fact:
+        drift_ssh: >-
+          [{% for r in ssh_checks.results %}
+          {% if r.stdout | lower != r.item.value | lower %}
+          {"drift_type": "config", "resource_name": "sshd_config:{{ r.item.key }}", "expected": "{{ r.item.value }}", "actual": "{{ r.stdout | default('not_set') }}", "severity": "critical"},
+          {% endif %}
+          {% endfor %}]
+
+    # ── Firewall drift ─────────────────────────────────────
+    - name: Check firewall status
+      ansible.builtin.shell: |
+        if command -v ufw &>/dev/null; then
+          ufw status | head -1 | awk '{print $2}'
+        elif command -v firewall-cmd &>/dev/null; then
+          firewall-cmd --state 2>/dev/null || echo "not_running"
+        else
+          echo "no_firewall"
+        fi
+      register: fw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Build firewall drift
+      ansible.builtin.set_fact:
+        drift_fw: >-
+          [{% if fw_status.stdout not in ['active', 'running'] %}
+          {"drift_type": "config", "resource_name": "firewall", "expected": "active", "actual": "{{ fw_status.stdout }}", "severity": "critical"}
+          {% endif %}]
+
+    # ── POST drift report ──────────────────────────────────
+    - name: Combine all drift items
+      ansible.builtin.set_fact:
+        all_drift: "{{ (drift_services | default([])) + (drift_ssh | default([])) + (drift_fw | default([])) }}"
+
+    - name: POST drift report to CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/drift/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          source: "ansible"
+          items: "{{ all_drift }}"
+        status_code: [200]
+        timeout: 30
+      delegate_to: localhost
+      when: all_drift | length > 0

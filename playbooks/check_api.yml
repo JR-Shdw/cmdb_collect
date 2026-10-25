@@ -1,0 +1,46 @@
+---
+# check_api.yml — Vérifie que chaque host peut joindre l'API CMDB
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/check_api.yml
+#   ansible-playbook -i inventory/hosts.ini playbooks/check_api.yml -l vega
+
+- name: Vérification connectivité API CMDB
+  hosts: all
+  gather_facts: false
+  vars:
+    cmdb_api_wg1: "http://10.0.1.1:8000"
+    cmdb_api_wg0: "http://10.0.0.1:8000"
+
+  tasks:
+
+    - name: Test connectivité API via wg1 (10.0.1.1:8000)
+      ansible.builtin.uri:
+        url: "{{ cmdb_api_wg1 }}/api/v1/health"
+        method: GET
+        timeout: 5
+        status_code: 200
+      register: result_wg1
+      ignore_errors: true
+
+    - name: Test connectivité API via wg0 (10.0.0.1:8000)
+      ansible.builtin.uri:
+        url: "{{ cmdb_api_wg0 }}/api/v1/health"
+        method: GET
+        timeout: 5
+        status_code: 200
+      register: result_wg0
+      ignore_errors: true
+
+    - name: Rapport connectivité
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}
+          | wg1 {{ cmdb_api_wg1 }}: {{ 'OK' if result_wg1.status == 200 else 'FAIL (' + (result_wg1.msg | default('unreachable')) + ')' }}
+          | wg0 {{ cmdb_api_wg0 }}: {{ 'OK' if result_wg0.status == 200 else 'FAIL (' + (result_wg0.msg | default('unreachable')) + ')' }}
+
+    - name: Échec si aucune route vers l'API
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} ne peut joindre l'API CMDB sur aucun réseau"
+      when:
+        - result_wg1.status is not defined or result_wg1.status != 200
+        - result_wg0.status is not defined or result_wg0.status != 200

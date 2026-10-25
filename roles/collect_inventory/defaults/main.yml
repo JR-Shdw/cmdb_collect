@@ -1,0 +1,12 @@
+---
+# Type groups — tous les types possibles (un node peut en avoir plusieurs)
+type_groups:
+  - bare_metal
+  - container_host
+  - vm
+  - bastion
+  - workstation
+
+# CMDB API
+cmdb_api_url: "http://10.0.1.1:8000"
+cmdb_api_token: ""

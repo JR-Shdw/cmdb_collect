@@ -1,0 +1,11 @@
+---
+# CMDB — collecte inventaire workstations (sudo, pas root)
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/collect_workstations.yml --ask-become-pass
+- name: CMDB — collecte workstations
+  hosts: workstation
+  gather_facts: true
+  become: true
+  become_method: sudo
+
+  roles:
+    - collect_inventory

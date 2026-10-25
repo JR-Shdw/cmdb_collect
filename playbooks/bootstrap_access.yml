@@ -1,0 +1,294 @@
+---
+# CMDB — Bootstrap secure Ansible access on managed nodes
+#
+# Creates two users with SSH forced commands (no sudo/doas needed):
+#   - cmdb-collect : inventory collection (read-only, no root for most tasks)
+#   - cmdb-scan    : trivy scans + docker inspect (root via forced command)
+#
+# Installs doas as lightweight privilege escalation for interactive debug:
+#   - Arch: opendoas (official repos)
+#   - Debian/Ubuntu: doas (official repos)
+#   - RHEL/Rocky/CentOS 7+: opendoas (EPEL)
+#   - AIX: skipped (uses native RBAC)
+#
+# IMPORTANT: This playbook must be run as root (initial bootstrap).
+# After this, all other playbooks can use the restricted users.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/bootstrap_access.yml
+#   ansible-playbook -i inventory/hosts.ini playbooks/bootstrap_access.yml -l vega
+#
+# Prerequisites:
+#   - Generate SSH keys before running:
+#     ssh-keygen -t ed25519 -f ~/.ssh/cmdb_collect_ed25519 -C "cmdb-collect"
+#     ssh-keygen -t ed25519 -f ~/.ssh/cmdb_scan_ed25519 -C "cmdb-scan"
+#   - For CentOS 5/6 (no ed25519 support):
+#     ssh-keygen -t rsa -b 4096 -f ~/.ssh/cmdb_collect_rsa -C "cmdb-collect-legacy"
+#     ssh-keygen -t rsa -b 4096 -f ~/.ssh/cmdb_scan_rsa -C "cmdb-scan-legacy"
+
+- name: CMDB — Bootstrap secure access
+  hosts: all:!workstation
+  gather_facts: true
+  become: true
+
+  vars:
+    # SSH public keys — override in group_vars/all/vault.yml
+    collect_pubkey: "{{ lookup('file', '~/.ssh/cmdb_collect_ed25519.pub') }}"
+    scan_pubkey: "{{ lookup('file', '~/.ssh/cmdb_scan_ed25519.pub') }}"
+    # Legacy RSA keys for CentOS 5/6 (optional)
+    collect_pubkey_rsa: "{{ lookup('file', '~/.ssh/cmdb_collect_rsa.pub', errors='ignore') | default('') }}"
+    scan_pubkey_rsa: "{{ lookup('file', '~/.ssh/cmdb_scan_rsa.pub', errors='ignore') | default('') }}"
+
+    # Wrapper scripts installed to this path
+    wrapper_dir: /usr/local/bin
+
+    # doas install control
+    install_doas: true
+
+  tasks:
+    # ── Detect OS family ─────────────────────────────────────
+    - name: Detect legacy CentOS (5/6)
+      ansible.builtin.set_fact:
+        is_legacy_centos: >-
+          {{ ansible_distribution in ['CentOS'] and
+             ansible_distribution_major_version | int < 7 }}
+
+    - name: Detect AIX
+      ansible.builtin.set_fact:
+        is_aix: "{{ ansible_system == 'AIX' }}"
+
+    # Choose ed25519 or RSA based on OS capability
+    - name: Set SSH key type
+      ansible.builtin.set_fact:
+        _collect_key: "{{ collect_pubkey_rsa if (is_legacy_centos | bool and collect_pubkey_rsa | length > 0) else collect_pubkey }}"
+        _scan_key: "{{ scan_pubkey_rsa if (is_legacy_centos | bool and scan_pubkey_rsa | length > 0) else scan_pubkey }}"
+        # CentOS 5/6 doesn't support 'restrict' keyword
+        # restrict,pty — restrict all EXCEPT PTY (needed for ansible raw module)
+        _ssh_restrict: "{{ 'no-port-forwarding,no-X11-forwarding,no-agent-forwarding' if (is_legacy_centos | bool) else 'restrict,pty' }}"
+
+    # ── Create users ─────────────────────────────────────────
+    - name: Create cmdb-collect user (no login shell)
+      ansible.builtin.user:
+        name: cmdb-collect
+        comment: "CMDB inventory collection (restricted)"
+        shell: /bin/sh
+        create_home: true
+        system: true
+      when: not (is_aix | bool)
+
+    - name: Create cmdb-collect user (AIX)
+      ansible.builtin.command: >
+        mkuser pgrp=staff home=/home/cmdb-collect shell=/bin/sh
+        gecos="CMDB inventory collection" cmdb-collect
+      when: is_aix | bool
+      register: mkuser_collect
+      changed_when: mkuser_collect.rc == 0
+      failed_when: mkuser_collect.rc != 0 and 'already exists' not in mkuser_collect.stderr
+      ignore_errors: true
+
+    - name: Create cmdb-scan user (no login shell)
+      ansible.builtin.user:
+        name: cmdb-scan
+        comment: "CMDB security scanning (restricted)"
+        shell: /bin/sh
+        create_home: true
+        system: true
+      when: not (is_aix | bool)
+
+    - name: Create cmdb-scan user (AIX)
+      ansible.builtin.command: >
+        mkuser pgrp=staff home=/home/cmdb-scan shell=/bin/sh
+        gecos="CMDB security scanning" cmdb-scan
+      when: is_aix | bool
+      register: mkuser_scan
+      changed_when: mkuser_scan.rc == 0
+      failed_when: mkuser_scan.rc != 0 and 'already exists' not in mkuser_scan.stderr
+      ignore_errors: true
+
+    # NOTE: cmdb-collect is NOT in the docker group.
+    # Docker socket = root equivalent (mount /, --privileged, etc.)
+    # All Docker operations go through cmdb-scan.sh (root forced command).
+
+    # ── Deploy wrapper scripts ───────────────────────────────
+    - name: Deploy collect wrapper
+      ansible.builtin.template:
+        src: ../templates/cmdb-collect.sh.j2
+        dest: "{{ wrapper_dir }}/cmdb-collect.sh"
+        owner: root
+        mode: "0755"
+
+    - name: Deploy scan wrapper
+      ansible.builtin.template:
+        src: ../templates/cmdb-scan.sh.j2
+        dest: "{{ wrapper_dir }}/cmdb-scan.sh"
+        owner: root
+        mode: "0755"
+
+    # ── SSH authorized_keys for cmdb-collect (user level) ────
+    - name: Ensure .ssh dir for cmdb-collect
+      ansible.builtin.file:
+        path: /home/cmdb-collect/.ssh
+        state: directory
+        owner: cmdb-collect
+        mode: "0700"
+
+    - name: Set authorized_keys for cmdb-collect
+      ansible.builtin.copy:
+        content: |
+          no-port-forwarding,no-X11-forwarding,no-agent-forwarding {{ _collect_key }}
+        dest: /home/cmdb-collect/.ssh/authorized_keys
+        owner: cmdb-collect
+        mode: "0600"
+
+    # ── SSH authorized_keys for cmdb-scan (root level) ────────
+    # trivy rootfs / and docker need root — forced command limits to wrapper only
+    - name: Ensure /root/.ssh exists
+      ansible.builtin.file:
+        path: /root/.ssh
+        state: directory
+        owner: root
+        mode: "0700"
+
+    - name: Add scan forced command to root authorized_keys
+      ansible.builtin.lineinfile:
+        path: /root/.ssh/authorized_keys
+        regexp: 'cmdb-scan\.sh'
+        line: 'command="{{ wrapper_dir }}/cmdb-scan.sh",{{ _ssh_restrict }} {{ _scan_key }}'
+        create: true
+        owner: root
+        mode: "0600"
+
+    # ── Install doas (Linux only, optional) ──────────────────
+    - name: Install doas (apt)
+      ansible.builtin.apt:
+        name: doas
+        state: present
+      when:
+        - install_doas | bool
+        - ansible_pkg_mgr == "apt"
+        - not (is_aix | bool)
+      ignore_errors: true
+
+    - name: Install doas (pacman)
+      ansible.builtin.pacman:
+        name: opendoas
+        state: present
+      when:
+        - install_doas | bool
+        - ansible_pkg_mgr == "pacman"
+      ignore_errors: true
+
+    - name: Install doas (dnf — EPEL)
+      ansible.builtin.dnf:
+        name: opendoas
+        state: present
+        enablerepo: epel
+      when:
+        - install_doas | bool
+        - ansible_pkg_mgr == "dnf"
+      ignore_errors: true
+
+    - name: Install doas (yum — EPEL, CentOS 7)
+      ansible.builtin.yum:
+        name: opendoas
+        state: present
+        enablerepo: epel
+      when:
+        - install_doas | bool
+        - ansible_pkg_mgr == "yum"
+        - ansible_distribution_major_version | int >= 7
+      ignore_errors: true
+
+    - name: Deploy doas.conf
+      ansible.builtin.copy:
+        content: |
+          # CMDB — minimal doas config (interactive debug only)
+          # Automation uses SSH forced commands, not doas
+          permit nopass cmdb-scan cmd /usr/local/bin/trivy
+          permit nopass cmdb-scan cmd /usr/bin/trivy
+          permit nopass cmdb-scan cmd /usr/bin/systemctl args status *
+          permit nopass cmdb-scan cmd /usr/bin/journalctl args -u *
+          deny cmdb-collect
+        dest: /etc/doas.conf
+        owner: root
+        mode: "0600"
+      when:
+        - install_doas | bool
+        - not (is_aix | bool)
+
+    # ── AIX RBAC (native, no install needed) ─────────────────
+    - name: Create AIX RBAC role for collect
+      ansible.builtin.command: >
+        mkrole authorizations=aix.system.config.list cmdb_collect_role
+      when: is_aix | bool
+      register: aix_role_collect
+      changed_when: aix_role_collect.rc == 0
+      failed_when: aix_role_collect.rc != 0 and 'already exists' not in aix_role_collect.stderr
+      ignore_errors: true
+
+    - name: Assign AIX RBAC role to cmdb-collect
+      ansible.builtin.command: >
+        chuser roles=cmdb_collect_role cmdb-collect
+      when: is_aix | bool
+      ignore_errors: true
+
+    # ── Add cmdb users to sshd AllowUsers (if configured) ──
+    - name: Check for AllowUsers in sshd config
+      ansible.builtin.shell: grep -r 'AllowUsers' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | head -1
+      register: sshd_allowusers
+      changed_when: false
+      failed_when: false
+
+    - name: Add cmdb-collect to AllowUsers
+      ansible.builtin.replace:
+        path: "{{ sshd_allowusers.stdout.split(':')[0] }}"
+        regexp: '(AllowUsers\s+(?!.*cmdb-collect).*)$'
+        replace: '\1 cmdb-collect'
+      when:
+        - sshd_allowusers.stdout | length > 0
+        - "'cmdb-collect' not in sshd_allowusers.stdout"
+      notify: Reload sshd
+
+    - name: Add cmdb-scan to AllowUsers
+      ansible.builtin.replace:
+        path: "{{ sshd_allowusers.stdout.split(':')[0] }}"
+        regexp: '(AllowUsers\s+(?!.*cmdb-scan).*)$'
+        replace: '\1 cmdb-scan'
+      when:
+        - sshd_allowusers.stdout | length > 0
+        - "'cmdb-scan' not in sshd_allowusers.stdout"
+      notify: Reload sshd
+
+    # ── Lock down: no password login ─────────────────────────
+    # NOTE: Do NOT use 'passwd -l' — it sets '!' in /etc/shadow which
+    # causes OpenSSH 10+ (Debian 13+) to reject pubkey auth with
+    # "account is locked". Using usermod -p '*' disables password login
+    # without triggering the locked-account check.
+    - name: Disable password login for cmdb-collect (Linux)
+      ansible.builtin.command: usermod -p '*' cmdb-collect
+      when: not (is_aix | bool)
+      changed_when: false
+
+    - name: Disable password login for cmdb-scan (Linux)
+      ansible.builtin.command: usermod -p '*' cmdb-scan
+      when: not (is_aix | bool)
+      changed_when: false
+
+    # ── Summary ──────────────────────────────────────────────
+    - name: Flush handlers now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Bootstrap summary
+      ansible.builtin.debug:
+        msg: |
+          ✓ cmdb-collect — user-level SSH access (unprivileged)
+          ✓ cmdb-scan    — root-level SSH forced command ({{ wrapper_dir }}/cmdb-scan.sh)
+          ✓ Key type: {{ 'RSA 4096 (legacy)' if (is_legacy_centos | bool) else 'ed25519' }}
+          ✓ doas: {{ 'installed' if (install_doas | bool and not (is_aix | bool)) else 'skipped (AIX RBAC)' }}
+          ✓ Passwords locked — SSH key only
+
+  handlers:
+    - name: Reload sshd
+      ansible.builtin.service:
+        name: sshd
+        state: reloaded

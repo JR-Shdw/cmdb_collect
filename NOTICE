@@ -1,0 +1,46 @@
+cmdb_collect
+Copyright (C) 2024-2026 shdw <contact@resurgamus.com>
+
+Ansible collector for Constellation (CMDB). Licensed under the Apache License,
+Version 2.0. The full license text is in the LICENSE file, or at
+http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+DO NOT REMOVE THIS FILE
+================================================================================
+
+Apache License 2.0 section 4(d) requires that the contents of this NOTICE file
+be reproduced in any Derivative Works that you distribute. Section 4(b)
+requires that copyright, patent, trademark and attribution notices in the
+source be retained.
+
+================================================================================
+AI / MACHINE-LEARNING TRAINING
+================================================================================
+
+A text-and-data-mining reservation is declared pursuant to article 4 of EU
+directive 2019/790 (DSM directive). Use of this codebase to train, fine-tune,
+evaluate or distill machine-learning models at commercial or large scale is
+not consented to under that reservation, and requires a separate written
+agreement with the copyright holder.
+
+This reservation is a statutory mechanism and is independent of the
+Apache-2.0 copyright grant.
+
+================================================================================
+NO WARRANTY
+================================================================================
+
+Provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
+See Apache License 2.0 sections 7 and 8.
+
+The project is funded by donations. Releases and fixes are never restricted to
+donors or sponsors. Deployment assistance, where offered, is a separate
+service and not part of this license.
+
+================================================================================
+CONTACT
+================================================================================
+
+shdw <contact@resurgamus.com>
+Companion project: Constellation (CMDB)

@@ -1,0 +1,16 @@
+# Ansible
+*.retry
+*.pyc
+__pycache__/
+
+# Vault password
+.vault_pass
+vault_password_file
+
+# Inventory secrets (encrypted files are OK)
+# inventory/host_vars/*/vault.yml is encrypted — safe to commit
+
+# SSH keys
+*.pem
+id_*
+woodpecker_ci/

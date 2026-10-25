@@ -1,0 +1,178 @@
+---
+# CMDB — Trivy scan via forced command (cmdb-scan)
+# Utilise les wrappers cmdb-scan.sh déployés par bootstrap_access.yml
+# Résultats POST directement vers la CMDB API depuis le contrôleur
+#
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/scan_trivy.yml --ask-vault-pass
+# Cron:  0 3 * * * (daily)
+#
+# Prérequis:
+#   - bootstrap_access.yml exécuté
+#   - trivy installé sur les nodes (install_trivy.yml)
+#   - Trivy server sur obs_stack (10.0.1.1:4954)
+
+- name: CMDB — Trivy CVE scan
+  hosts: all:!workstation
+  gather_facts: false
+  become: false
+  vars:
+    ansible_user: root
+    ansible_ssh_private_key_file: "~/.ssh/cmdb_scan_ed25519"
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_token: "{{ cmdb_api_token }}"
+
+  tasks:
+    # ── Vérifier que trivy est disponible ──────────────────
+    - name: Check trivy is installed
+      ansible.builtin.raw: trivy-version
+      register: trivy_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Skip host if trivy not installed
+      ansible.builtin.debug:
+        msg: "trivy not found on {{ inventory_hostname }}, skipping"
+      when: trivy_check is failed
+
+    # ── Host filesystem scan (packages OS + secrets) ────────
+    - name: Trivy rootfs scan (forced command)
+      ansible.builtin.raw: trivy-rootfs
+      register: trivy_host_result
+      changed_when: false
+      ignore_errors: true
+      when: trivy_check is not failed
+
+    - name: Parse host vulnerabilities
+      ansible.builtin.set_fact:
+        host_vulns: >-
+          {{ (trivy_host_result.stdout | from_json).Results
+             | default([])
+             | map(attribute='Vulnerabilities', default=[])
+             | flatten }}
+        host_secrets: >-
+          {{ (trivy_host_result.stdout | from_json).Results
+             | default([])
+             | map(attribute='Secrets', default=[])
+             | flatten }}
+      when:
+        - trivy_check is not failed
+        - trivy_host_result is not failed
+      delegate_to: localhost
+
+    - name: POST host CVEs to CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/cves/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          source: "trivy"
+          target_type: "package"
+          vulnerabilities: "{{ host_vulns | default([]) }}"
+        status_code: [200]
+        timeout: 120
+      delegate_to: localhost
+      when:
+        - trivy_check is not failed
+        - trivy_host_result is not failed
+
+    - name: POST host secrets to CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/secrets/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          target_type: "host"
+          secrets: "{{ host_secrets | default([]) }}"
+        status_code: [200]
+        timeout: 60
+      delegate_to: localhost
+      when:
+        - trivy_check is not failed
+        - trivy_host_result is not failed
+        - (host_secrets | default([])) | length > 0
+
+    # ── Container image scan (si container_host) ────────────
+    - name: List running container images (forced command)
+      ansible.builtin.raw: docker-images
+      register: docker_images
+      changed_when: false
+      ignore_errors: true
+      when:
+        - "'container_host' in group_names"
+        - trivy_check is not failed
+
+    - name: Trivy image scan per container (forced command)
+      ansible.builtin.raw: "trivy-image {{ item }}"
+      register: trivy_image_results
+      changed_when: false
+      ignore_errors: true
+      loop: "{{ docker_images.stdout_lines | default([]) | select() | list }}"
+      when:
+        - "'container_host' in group_names"
+        - trivy_check is not failed
+        - docker_images is not failed
+
+    - name: POST container CVEs to CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/cves/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          source: "trivy"
+          target_type: "container"
+          target_name: "{{ item.item }}"
+          image: "{{ item.item }}"
+          vulnerabilities: >-
+            {{ (item.stdout | from_json).Results
+               | default([])
+               | map(attribute='Vulnerabilities', default=[])
+               | flatten }}
+        status_code: [200]
+        timeout: 120
+      delegate_to: localhost
+      loop: "{{ trivy_image_results.results | default([]) }}"
+      when:
+        - "'container_host' in group_names"
+        - trivy_check is not failed
+        - item is not failed
+        - item.stdout | default('') | length > 2
+
+    - name: POST container secrets to CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/secrets/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          target_type: "container"
+          image: "{{ item.item }}"
+          secrets: >-
+            {{ (item.stdout | from_json).Results
+               | default([])
+               | map(attribute='Secrets', default=[])
+               | flatten }}
+        status_code: [200]
+        timeout: 60
+      delegate_to: localhost
+      loop: "{{ trivy_image_results.results | default([]) }}"
+      when:
+        - "'container_host' in group_names"
+        - trivy_check is not failed
+        - item is not failed
+        - item.stdout | default('') | length > 2
+        - ((item.stdout | from_json).Results | default([]) | map(attribute='Secrets', default=[]) | flatten) | length > 0

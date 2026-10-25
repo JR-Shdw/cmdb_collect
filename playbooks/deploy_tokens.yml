@@ -1,0 +1,203 @@
+---
+# CMDB — Deploy per-node collect tokens
+#
+# Creates a unique API token per node via the CMDB API, then stores it
+# in the node's host_vars vault file (encrypted with Ansible Vault).
+#
+# Each token has scope collect:w only — cannot read data, cannot admin.
+# Idempotent: skips nodes that already have a valid token + vault file.
+#
+# Usage:
+#   # Deploy tokens to all nodes
+#   ansible-playbook -i inventory/hosts.ini playbooks/deploy_tokens.yml \
+#     --ask-vault-pass
+#
+#   # Single node (or comma-separated list)
+#   ansible-playbook -i inventory/hosts.ini playbooks/deploy_tokens.yml \
+#     -l bellatrix --ask-vault-pass
+#
+#   # Force recreate all tokens (delete + recreate)
+#   ansible-playbook -i inventory/hosts.ini playbooks/deploy_tokens.yml \
+#     -e force_recreate=true --ask-vault-pass
+#
+#   # Deploy with 24h expiration
+#   ansible-playbook -i inventory/hosts.ini playbooks/deploy_tokens.yml \
+#     -e token_ttl_hours=24 --ask-vault-pass
+#
+# Prerequisites:
+#   - CMDB API running and reachable from controller
+#   - Admin token (API_SECRET_KEY) in vault or env
+#
+# Security:
+#   - Token shown once at creation, stored immediately in vault
+#   - Each node gets its own token — compromise = revoke one node only
+#   - Tokens stored encrypted (Ansible Vault) in host_vars/
+#   - Old token for same node is revoked before creating new one
+
+- name: CMDB — Deploy per-node collect tokens
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_admin_token: "{{ cmdb_secret_key }}"
+    # Token TTL: 0 = permanent, >0 = hours until expiry
+    token_ttl_hours: 0
+    # Force recreate: delete existing tokens and create new ones
+    force_recreate: false
+    # Target hosts — respects -l/--limit flag
+    target_hosts: >-
+      {{ query('inventory_hostnames', ansible_limit)
+         | difference(groups.get('workstation', []))
+         if ansible_limit is defined
+         else (groups['all'] | difference(groups.get('workstation', []))) }}
+    # Vault file location
+    host_vars_dir: "{{ playbook_dir }}/../inventory/host_vars"
+    # Vault password file — override with -e vault_password_file=/path/to/.vault_pass
+    # If not set, ansible-vault will prompt interactively (requires --ask-vault-pass)
+    vault_password_file: "{{ lookup('env', 'ANSIBLE_VAULT_PASSWORD_FILE') | default(omit, true) }}"
+
+  tasks:
+    - name: Ensure host_vars directory exists
+      ansible.builtin.file:
+        path: "{{ host_vars_dir }}"
+        state: directory
+        mode: "0700"
+
+    # ── List existing tokens to find duplicates ────────────
+    - name: Fetch existing CMDB tokens
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        return_content: true
+      register: existing_tokens
+
+    - name: Build existing token name map
+      ansible.builtin.set_fact:
+        token_map: >-
+          {{ existing_tokens.json['items']
+             | items2dict(key_name='name', value_name='id')
+             if (existing_tokens.json['items'] | default([]) | length > 0)
+             else {} }}
+
+    # ── Check which hosts already have a vault file ────────
+    - name: Check existing vault files
+      ansible.builtin.stat:
+        path: "{{ host_vars_dir }}/{{ item }}/vault.yml"
+      loop: "{{ target_hosts }}"
+      register: vault_files
+
+    - name: Build list of hosts needing tokens
+      ansible.builtin.set_fact:
+        hosts_need_token: >-
+          {{ target_hosts if (force_recreate | bool)
+             else target_hosts | select('in',
+               vault_files.results
+               | rejectattr('stat.exists')
+               | map(attribute='item')
+               | list
+               + (target_hosts | reject('in',
+                   token_map | dict2items | map(attribute='key')
+                   | map('regex_replace', '^node-', '') | list)
+                 | list)
+             ) | unique | list }}
+
+    - name: Show target status
+      ansible.builtin.debug:
+        msg: >-
+          Target hosts: {{ target_hosts | length }} —
+          Already have token: {{ target_hosts | length - hosts_need_token | length }} —
+          Need token: {{ hosts_need_token | length }}
+          {{ '(force_recreate=true)' if (force_recreate | bool) else '' }}
+
+    # ── Delete old tokens (only for hosts being (re)created) ──
+    - name: Delete old node token if exists
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens/{{ token_map['node-' + item] }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        status_code: [200, 404]
+      loop: "{{ hosts_need_token }}"
+      when: "('node-' + item) in (token_map | default({}))"
+      ignore_errors: true
+
+    # ── Calculate expiration if TTL set ────────────────────
+    - name: Calculate expiration timestamp
+      ansible.builtin.set_fact:
+        token_expires: >-
+          {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int + (token_ttl_hours | int * 3600))
+             if (token_ttl_hours | int > 0)
+             else omit }}
+      when: token_ttl_hours | int > 0
+
+    # ── Create one token per node ──────────────────────────
+    - name: Create CMDB token for each node
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "node-{{ item }}"
+          description: "Collect token for {{ item }} — auto-generated by deploy_tokens.yml"
+          permissions:
+            collect: "w"
+          expires_at: "{{ token_expires | default(omit) }}"
+        status_code: [200, 201]
+        return_content: true
+      loop: "{{ hosts_need_token }}"
+      register: created_tokens
+
+    # ── Store tokens in host_vars vault files ──────────────
+    - name: Ensure host_vars subdirectory per node
+      ansible.builtin.file:
+        path: "{{ host_vars_dir }}/{{ item.item }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ created_tokens.results }}"
+      when: item.json is defined
+
+    - name: Write token to vault file
+      ansible.builtin.copy:
+        content: |
+          ---
+          # CMDB collect token for {{ item.item }}
+          # Auto-generated by deploy_tokens.yml — do not edit
+          # Token ID: {{ item.json.id }}
+          # Expires: {{ item.json.expires_at | default('never') }}
+          cmdb_api_token: "{{ item.json.token }}"
+        dest: "{{ host_vars_dir }}/{{ item.item }}/vault.yml"
+        mode: "0600"
+      loop: "{{ created_tokens.results }}"
+      when: item.json is defined
+
+    - name: Encrypt vault files
+      ansible.builtin.command: >
+        ansible-vault encrypt
+        {% if vault_password_file is defined %}--vault-password-file {{ vault_password_file }}{% endif %}
+        {{ host_vars_dir }}/{{ item.item }}/vault.yml
+      loop: "{{ created_tokens.results }}"
+      when: item.json is defined
+      changed_when: true
+
+    # ── Summary ────────────────────────────────────────────
+    - name: Token deployment summary
+      ansible.builtin.debug:
+        msg: |
+          {% if hosts_need_token | length > 0 %}
+          Tokens deployed for {{ created_tokens.results | length }} node(s):
+          {% for r in created_tokens.results %}
+          - {{ r.item }}: {{ r.json.token_hint | default('error') }}
+            {% if token_ttl_hours | int > 0 %}expires in {{ token_ttl_hours }}h{% else %}permanent{% endif %}
+          {% endfor %}
+          {% else %}
+          All {{ target_hosts | length }} node(s) already have tokens — nothing to do.
+          {% endif %}
+
+          Vault files stored in: {{ host_vars_dir }}/

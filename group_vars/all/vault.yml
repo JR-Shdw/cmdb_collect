@@ -1,0 +1,7 @@
+# Ansible Vault — CMDB tokens
+# Chiffrer avec : ansible-vault encrypt ansible/group_vars/all/vault.yml
+# Le vault password doit être dans .vault_pass (non commité)
+#
+# IMPORTANT: remplacer par les vrais tokens avant de chiffrer
+
+cmdb_api_token: "REMPLACER_PAR_VOTRE_COLLECT_TOKEN"

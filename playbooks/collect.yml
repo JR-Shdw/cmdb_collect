@@ -1,0 +1,175 @@
+---
+# CMDB — collecte inventaire serveurs
+#
+# Deux passes :
+#   1. cmdb-collect (sans privilège) : OS, packages, kernel
+#   2. cmdb-scan (root forced cmd)   : lshw, docker inspect
+#
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/collect.yml --ask-vault-pass
+#
+# Prérequis: bootstrap_access.yml exécuté sur les nodes cibles
+# Fallback:  si cmdb-collect n'existe pas, utilise root (legacy)
+
+# ── Pass 1 : collecte sans privilège ────────────────────────
+- name: CMDB — collecte inventaire (user)
+  hosts: all:!workstation
+  gather_facts: true
+  become: false
+  vars:
+    ansible_user: cmdb-collect
+    ansible_ssh_private_key_file: "~/.ssh/cmdb_collect_ed25519"
+
+  tasks:
+    - name: Calculer les types du node
+      ansible.builtin.set_fact:
+        node_types: >-
+          {{ type_groups | select('in', group_names) | list | default(['vm'], true) }}
+
+    - name: Lire /etc/os-release
+      ansible.builtin.slurp:
+        src: /etc/os-release
+      register: os_release_raw
+      ignore_errors: true
+
+    - name: Kernel
+      ansible.builtin.command: uname -r
+      register: kernel_ver
+      changed_when: false
+
+    # ── Paquets ──────────────────────────────────────────────
+    - name: Paquets apt (Debian/Ubuntu)
+      ansible.builtin.command: dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n'
+      register: pkgs_apt
+      when: ansible_pkg_mgr == "apt"
+      changed_when: false
+
+    - name: Paquets pacman (Arch/Manjaro)
+      ansible.builtin.command: pacman -Q
+      register: pkgs_pacman
+      when: ansible_pkg_mgr == "pacman"
+      changed_when: false
+
+    - name: Paquets rpm (RHEL/Rocky/CentOS/Fedora)
+      ansible.builtin.command: rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n'
+      register: pkgs_rpm
+      when: ansible_pkg_mgr in ("dnf", "yum")
+      changed_when: false
+
+    - name: Paquets AIX (lslpp)
+      ansible.builtin.shell: lslpp -Lc 2>/dev/null | awk -F':' 'NR>1 {print $2"\t"$3"\t"$5}'
+      register: pkgs_aix
+      when: ansible_system == "AIX"
+      changed_when: false
+      ignore_errors: true
+
+# ── Pass 2 : collecte privilégiée (root forced command) ─────
+- name: CMDB — collecte inventaire (scan)
+  hosts: all:!workstation
+  gather_facts: false
+  become: false
+  vars:
+    ansible_user: root
+    ansible_ssh_private_key_file: "~/.ssh/cmdb_scan_ed25519"
+
+  tasks:
+    - name: Hardware via lshw (forced command)
+      ansible.builtin.raw: lshw
+      register: hw_info_raw
+      ignore_errors: true
+      changed_when: false
+
+    - name: Containers Docker (forced command)
+      ansible.builtin.raw: docker-inspect
+      register: docker_containers
+      ignore_errors: true
+      changed_when: false
+      when: "'container_host' in group_names"
+
+    - name: Detect GeoIP (forced command)
+      ansible.builtin.raw: detect-geoip
+      register: geoip_detect
+      ignore_errors: true
+      changed_when: false
+
+    - name: Detect firewall (forced command)
+      ansible.builtin.raw: detect-firewall
+      register: firewall_detect
+      ignore_errors: true
+      changed_when: false
+
+# ── Pass 3 : push vers API CMDB ────────────────────────────
+- name: CMDB — push inventaire
+  hosts: all:!workstation
+  gather_facts: false
+  connection: local
+
+  vars:
+    cmdb_api_url: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  tasks:
+    # Parse docker inspect JSON into CMDB container format
+    - name: Transform containers from docker inspect
+      ansible.builtin.set_fact:
+        _cmdb_containers: "{{ _ctr_json | from_json }}"
+      vars:
+        _ctr_json: >-
+          {% set raw_str = hostvars[inventory_hostname].docker_containers.stdout | default('[]')
+             if hostvars[inventory_hostname].docker_containers is defined
+             and hostvars[inventory_hostname].docker_containers is not failed
+             else '[]' %}
+          {% set parsed = raw_str | from_json if (raw_str | trim).startswith('[') else [] %}
+          {% set result = [] %}
+          {% for c in parsed %}
+          {%   set name = c.Name | default('/unknown') | regex_replace('^/', '') %}
+          {%   set img = c.Config.Image | default('') if c.Config is defined else '' %}
+          {%   set state = c.State.Status | default('') if c.State is defined else '' %}
+          {%   set labels = c.Config.Labels | default({}) if c.Config is defined else {} %}
+          {%   set nets = c.NetworkSettings.Networks | default({}) | list if c.NetworkSettings is defined else [] %}
+          {%   set ports = [] %}
+          {%   if c.NetworkSettings is defined and c.NetworkSettings.Ports is defined %}
+          {%     for port, bindings in (c.NetworkSettings.Ports | default({})).items() %}
+          {%       if bindings is not none %}
+          {%         for b in bindings %}
+          {%           set _ = ports.append({"host_ip": b.HostIp | default(""), "host_port": b.HostPort | default(""), "container_port": port}) %}
+          {%         endfor %}
+          {%       endif %}
+          {%     endfor %}
+          {%   endif %}
+          {%   set _ = result.append({"name": name, "image": img, "status": state, "labels": labels, "networks": nets, "port_bindings": ports, "digest": c.Image | default('')}) %}
+          {% endfor %}
+          {{ result | to_json }}
+      delegate_to: localhost
+
+    - name: Push vers API CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api_url }}/api/v1/nodes/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          type: "{{ hostvars[inventory_hostname].node_types | default(['vm']) }}"
+          os: "{{ hostvars[inventory_hostname].ansible_distribution | default('unknown') | lower }}"
+          os_version: "{{ hostvars[inventory_hostname].ansible_distribution_version | default('') }}"
+          arch: "{{ hostvars[inventory_hostname].ansible_architecture | default('') }}"
+          kernel: "{{ hostvars[inventory_hostname].kernel_ver.stdout | default('') }}"
+          ip_address: "{{ hostvars[inventory_hostname].ansible_default_ipv4.address | default(hostvars[inventory_hostname].ansible_host | default('')) }}"
+          os_raw: "{{ (hostvars[inventory_hostname].os_release_raw.content | default('') | b64decode) if hostvars[inventory_hostname].os_release_raw is defined and hostvars[inventory_hostname].os_release_raw is not failed else '' }}"
+          hw_info: >-
+            {% set raw = hostvars[inventory_hostname].hw_info_raw.stdout | default('{}')
+               if hostvars[inventory_hostname].hw_info_raw is defined and hostvars[inventory_hostname].hw_info_raw is not failed
+               else '{}' %}
+            {{ raw if (raw | trim).startswith('{') or (raw | trim).startswith('[') else '{}' }}
+          packages: >-
+            {{ (hostvars[inventory_hostname].pkgs_apt.stdout_lines | default([]))
+             + (hostvars[inventory_hostname].pkgs_pacman.stdout_lines | default([]))
+             + (hostvars[inventory_hostname].pkgs_rpm.stdout_lines | default([]))
+             + (hostvars[inventory_hostname].pkgs_aix.stdout_lines | default([])) }}
+          containers: "{{ _cmdb_containers | default([]) }}"
+          host_geoip: "{{ hostvars[inventory_hostname].geoip_detect.stdout | default('none') | trim }}"
+          host_firewall: "{{ hostvars[inventory_hostname].firewall_detect.stdout | default('none') | trim }}"
+        status_code: [200, 201]
+        timeout: 30

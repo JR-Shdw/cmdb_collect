@@ -1,0 +1,132 @@
+---
+# CMDB — Revoke per-node collect tokens
+#
+# Revokes (or deletes) API tokens for specified nodes.
+# Use after node decommission, compromise, or key rotation.
+#
+# Usage:
+#   # Revoke all node tokens (soft — can re-activate later)
+#   ansible-playbook -i inventory/hosts.ini playbooks/revoke_tokens.yml
+#
+#   # Revoke specific node
+#   ansible-playbook -i inventory/hosts.ini playbooks/revoke_tokens.yml \
+#     -e target_node=vega
+#
+#   # Hard delete (permanent, irreversible)
+#   ansible-playbook -i inventory/hosts.ini playbooks/revoke_tokens.yml \
+#     -e hard_delete=true
+#
+#   # Revoke all expired tokens (cleanup)
+#   ansible-playbook -i inventory/hosts.ini playbooks/revoke_tokens.yml \
+#     -e revoke_expired=true
+
+- name: CMDB — Revoke node tokens
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_admin_token: "{{ cmdb_secret_key }}"
+    # Single node or all
+    target_node: ""
+    # Hard delete vs soft revoke
+    hard_delete: false
+    # Revoke only expired tokens
+    revoke_expired: false
+    # host_vars vault dir
+    host_vars_dir: "{{ playbook_dir }}/../inventory/host_vars"
+
+  tasks:
+    # ── Fetch existing tokens ──────────────────────────────
+    - name: Fetch all CMDB tokens
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        return_content: true
+      register: all_tokens
+
+    # ── Filter tokens to revoke ────────────────────────────
+    - name: Identify node tokens to revoke
+      ansible.builtin.set_fact:
+        tokens_to_revoke: >-
+          {% set result = [] -%}
+          {% for t in all_tokens.json.items | default([]) -%}
+            {% if t.name.startswith('node-') -%}
+              {% if target_node and t.name != 'node-' + target_node -%}
+                {% continue -%}
+              {% endif -%}
+              {% if revoke_expired | bool -%}
+                {% if t.expires_at is defined and t.expires_at and t.active -%}
+                  {{ result.append(t) | default('') -}}
+                {% endif -%}
+              {% else -%}
+                {{ result.append(t) | default('') -}}
+              {% endif -%}
+            {% endif -%}
+          {% endfor -%}
+          {{ result }}
+
+    - name: Show tokens to revoke
+      ansible.builtin.debug:
+        msg: |
+          Tokens to {{ 'DELETE' if hard_delete | bool else 'REVOKE' }}:
+          {% for t in tokens_to_revoke %}
+          - {{ t.name }} ({{ t.token_hint }}) active={{ t.active }} expires={{ t.expires_at | default('never') }}
+          {% endfor %}
+          Total: {{ tokens_to_revoke | length }}
+
+    - name: Confirm action
+      ansible.builtin.pause:
+        prompt: "Proceed with {{ 'DELETING' if hard_delete | bool else 'revoking' }} {{ tokens_to_revoke | length }} token(s)? (yes/no)"
+      register: confirm
+      when: tokens_to_revoke | length > 0
+
+    - name: Abort if not confirmed
+      ansible.builtin.fail:
+        msg: "Aborted by user"
+      when:
+        - tokens_to_revoke | length > 0
+        - confirm.user_input | default('no') != 'yes'
+
+    # ── Revoke or delete ───────────────────────────────────
+    - name: Revoke tokens (soft)
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens/{{ item.id }}/revoke"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        status_code: [200]
+      loop: "{{ tokens_to_revoke }}"
+      when:
+        - not (hard_delete | bool)
+        - item.active | default(false)
+
+    - name: Delete tokens (hard)
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        status_code: [200]
+      loop: "{{ tokens_to_revoke }}"
+      when: hard_delete | bool
+
+    # ── Clean up vault files ───────────────────────────────
+    - name: Remove vault files for revoked nodes
+      ansible.builtin.file:
+        path: "{{ host_vars_dir }}/{{ item.name | replace('node-', '') }}/vault.yml"
+        state: absent
+      loop: "{{ tokens_to_revoke }}"
+      when: hard_delete | bool
+      ignore_errors: true
+
+    # ── Summary ────────────────────────────────────────────
+    - name: Revocation summary
+      ansible.builtin.debug:
+        msg: |
+          {{ 'Deleted' if hard_delete | bool else 'Revoked' }} {{ tokens_to_revoke | length }} token(s).
+          {% if hard_delete | bool %}Vault files removed.{% else %}Tokens can be re-activated via the CMDB UI or API.{% endif %}
+      when: tokens_to_revoke | length > 0

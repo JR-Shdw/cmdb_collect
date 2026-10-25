@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2024-2026 shdw <contact@resurgamus.com>
+---
+# Wazuh agent — bump client_buffer pour eviter rule 203 (queue full)
+#
+# Defauts Wazuh :
+#   queue_size         = 5000     -> on bump a 50000  (x10)
+#   events_per_second  = 500      -> on bump a 1000   (x2)
+#
+# Idempotent : si les valeurs sont deja a jour, pas de restart.
+#
+# Usage :
+#   ansible-playbook -i inventory/hosts.ini playbooks/wazuh_buffer_bump.yml --ask-vault-pass
+
+- name: Wazuh — bump agent client_buffer sizing
+  hosts: all:!workstation
+  gather_facts: false
+  become: true
+  vars:
+    wazuh_conf: /var/ossec/etc/ossec.conf
+    wazuh_queue_size: 50000
+    wazuh_events_per_second: 1000
+
+  tasks:
+    - name: Check Wazuh agent installed
+      ansible.builtin.stat:
+        path: "{{ wazuh_conf }}"
+      register: _ossec_conf
+
+    - name: Skip — Wazuh not installed
+      ansible.builtin.meta: end_host
+      when: not _ossec_conf.stat.exists
+
+    - name: Backup current ossec.conf
+      ansible.builtin.copy:
+        src: "{{ wazuh_conf }}"
+        dest: "{{ wazuh_conf }}.bak-{{ '%Y%m%dT%H%M%S' | strftime }}"
+        remote_src: true
+        mode: '0640'
+      changed_when: false
+
+    # Read remote ossec.conf into a controller variable. lookup('file')
+    # would read the controller's filesystem, not the target's.
+    - name: Read remote ossec.conf
+      ansible.builtin.slurp:
+        src: "{{ wazuh_conf }}"
+      register: _ossec_raw
+
+    - name: Decode current config
+      ansible.builtin.set_fact:
+        _ossec_text: "{{ _ossec_raw.content | b64decode }}"
+
+    - name: Ensure client_buffer block exists (insert before </ossec_config> if missing)
+      ansible.builtin.blockinfile:
+        path: "{{ wazuh_conf }}"
+        marker: "  <!-- {mark} ANSIBLE MANAGED CLIENT_BUFFER -->"
+        insertbefore: "</ossec_config>"
+        block: |
+          <client_buffer>
+            <disabled>no</disabled>
+            <queue_size>{{ wazuh_queue_size }}</queue_size>
+            <events_per_second>{{ wazuh_events_per_second }}</events_per_second>
+          </client_buffer>
+      register: _buffer_block
+      when: "'<client_buffer>' not in _ossec_text"
+
+    - name: Update queue_size if client_buffer already present
+      ansible.builtin.replace:
+        path: "{{ wazuh_conf }}"
+        regexp: '<queue_size>\d+</queue_size>'
+        replace: "<queue_size>{{ wazuh_queue_size }}</queue_size>"
+      register: _qs_replace
+      when: "'<client_buffer>' in _ossec_text"
+
+    - name: Update events_per_second if client_buffer already present
+      ansible.builtin.replace:
+        path: "{{ wazuh_conf }}"
+        regexp: '<events_per_second>\d+</events_per_second>'
+        replace: "<events_per_second>{{ wazuh_events_per_second }}</events_per_second>"
+      register: _eps_replace
+      when: "'<client_buffer>' in _ossec_text"
+
+    - name: Ensure client_buffer is enabled (disabled=no)
+      ansible.builtin.replace:
+        path: "{{ wazuh_conf }}"
+        regexp: '<disabled>yes</disabled>'
+        replace: '<disabled>no</disabled>'
+      register: _enable_replace
+      when: "'<client_buffer>' in _ossec_text"
+
+    - name: Restart wazuh-agent if config changed
+      ansible.builtin.systemd:
+        name: wazuh-agent
+        state: restarted
+      when: >
+        (_buffer_block is defined and _buffer_block.changed) or
+        (_qs_replace is defined and _qs_replace.changed) or
+        (_eps_replace is defined and _eps_replace.changed) or
+        (_enable_replace is defined and _enable_replace.changed)
+
+    - name: Show effective values
+      ansible.builtin.command: >
+        grep -E '<(queue_size|events_per_second|disabled)>' {{ wazuh_conf }}
+      register: _eff
+      changed_when: false
+
+    - name: Display
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — {{ _eff.stdout_lines | select('search', '(queue_size|events_per_second)') | list }}"

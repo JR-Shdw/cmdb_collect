@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2024-2026 shdw <contact@resurgamus.com>
+---
+# CMDB — Trivy misconfiguration scan via forced command
+# Utilise le wrapper cmdb-scan.sh (trivy-config)
+#
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/scan_misconf.yml --ask-vault-pass
+# Cron:  0 4 * * 0 (weekly)
+
+- name: CMDB — Trivy config scan
+  hosts: all:!workstation
+  gather_facts: false
+  become: false
+  vars:
+    ansible_user: root
+    ansible_ssh_private_key_file: "~/.ssh/cmdb_scan_ed25519"
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_token: "{{ cmdb_api_token }}"
+
+  tasks:
+    - name: Check trivy is installed
+      ansible.builtin.raw: trivy-version
+      register: trivy_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Trivy config scan (forced command)
+      ansible.builtin.raw: trivy-config
+      register: trivy_config_result
+      changed_when: false
+      ignore_errors: true
+      when: trivy_check is not failed
+
+    - name: Build misconf list with Target context
+      ansible.builtin.set_fact:
+        _misconf_items: >-
+          {% set items = [] %}
+          {% for r in (trivy_config_result.stdout | from_json).Results | default([]) %}
+            {% for m in r.Misconfigurations | default([]) %}
+              {% set _ = m.update({"Target": r.Target | default("")}) %}
+              {% set _ = items.append(m) %}
+            {% endfor %}
+          {% endfor %}
+          {{ items | to_json }}
+      when:
+        - trivy_check is not failed
+        - trivy_config_result is not failed
+        - (trivy_config_result.stdout | from_json).Results | default([]) | length > 0
+
+    - name: POST misconfigurations to CMDB
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/misconfigurations/report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          hostname: "{{ inventory_hostname }}"
+          source: "trivy"
+          misconfigurations: "{{ _misconf_items | default([]) }}"
+        status_code: [200]
+        timeout: 30
+      delegate_to: localhost
+      # Always POST — even with an empty list — so the API bumps
+      # last_trivy_config_scan and the host doesn't look "never
+      # scanned" once it hardens to a clean state.
+      when:
+        - trivy_check is not failed
+        - trivy_config_result is not failed

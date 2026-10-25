@@ -1,0 +1,224 @@
+---
+# CMDB — Collecte des logs restic-backup existants
+# Parse les logs dans /var/log/restic-backup/ et POST vers CMDB
+# Utilise cmdb-collect (lecture sans privilège)
+#
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/collect_backup_logs.yml --ask-vault-pass
+# Scope: dernier jour par defaut, ajustable via max_age_hours
+#
+# Note: les logs doivent être lisibles par cmdb-collect.
+# Si ce n'est pas le cas, ajouter une ACL:
+#   setfacl -R -m u:cmdb-collect:rX /var/log/restic-backup/
+
+- name: CMDB — Collect restic backup logs
+  hosts: all:!workstation
+  gather_facts: false
+  become: false
+  vars:
+    ansible_user: cmdb-collect
+    ansible_ssh_private_key_file: "~/.ssh/cmdb_collect_ed25519"
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_token: "{{ cmdb_api_token }}"
+    log_dirs:
+      - /var/log/restic-backup
+      - /var/log/backup
+    max_age_hours: 48
+
+  tasks:
+    - name: Find recent restic log files
+      ansible.builtin.find:
+        paths: "{{ log_dirs }}"
+        patterns:
+          - "restic-backup-*.log"
+          - "restic-backup.log"
+          - "*.log"
+        age: "-{{ max_age_hours }}h"
+        recurse: false
+      register: log_files
+      ignore_errors: true
+
+    - name: Parse and POST backup logs
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, os, re, sys, urllib.request
+        from pathlib import Path
+        from datetime import datetime
+
+        CMDB_API = os.environ["CMDB_API"]
+        CMDB_TOKEN = os.environ["CMDB_TOKEN"]
+        HOSTNAME = os.environ["CMDB_HOSTNAME"]
+        LOG_FILES = json.loads(os.environ["LOG_FILES_JSON"])
+
+        def parse_json_log(content):
+            for line in content.splitlines():
+                if '"message_type":"summary"' in line or '"message_type": "summary"' in line:
+                    try:
+                        d = json.loads(line)
+                        return {
+                            "status": "success",
+                            "files_new": d.get("files_new", 0),
+                            "files_changed": d.get("files_changed", 0),
+                            "files_unmodified": d.get("files_unmodified", 0),
+                            "size_added": d.get("data_added", 0),
+                            "snapshots_total": d.get("snapshot_id", ""),
+                            "duration_secs": int(d.get("total_duration", 0)),
+                            "raw": d,
+                        }
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            return None
+
+        def parse_text_log(content):
+            result = {"status": "unknown", "files_new": 0, "files_changed": 0,
+                      "files_unmodified": 0, "size_added": 0, "duration_secs": 0, "raw": {}}
+
+            if re.search(r"Result:\s*OK", content):
+                result["status"] = "success"
+            elif re.search(r"\[OK\] CMDB post: http=200", content):
+                result["status"] = "success"
+            elif re.search(r"snapshot [a-f0-9]+ saved", content):
+                result["status"] = "success"
+            elif re.search(r"keep \d+ snapshots:", content):
+                result["status"] = "success"
+
+            if re.search(r"Result:\s*FAIL|unable to create lock|FATAL|Fatal:", content):
+                if result["status"] == "unknown":
+                    result["status"] = "failure"
+                for pattern in [
+                    r"unable to create lock[^\"]*",
+                    r"(?:Fatal|FATAL)[:\s]+(.*)",
+                    r'"message_type":"exit_error".*?"message":"([^"]+)"',
+                ]:
+                    m = re.search(pattern, content)
+                    if m:
+                        result["error_msg"] = (m.group(0) if not m.lastindex else m.group(1)).strip()[:500]
+                        break
+
+            if re.search(r'"message_type":"exit_error"', content) and result["status"] == "unknown":
+                result["status"] = "warning"
+                m = re.search(r'"message_type":"exit_error".*?"message":"([^"]+)"', content)
+                if m:
+                    result["error_msg"] = m.group(1)[:500]
+
+            m = re.search(r"Files:\s+(\d+)\s+new,\s+(\d+)\s+changed,\s+(\d+)\s+unmodified", content)
+            if m:
+                result["files_new"] = int(m.group(1))
+                result["files_changed"] = int(m.group(2))
+                result["files_unmodified"] = int(m.group(3))
+
+            m = re.search(r"Added to the repo(?:sitory)?:\s+([\d.]+)\s+(\w+)", content)
+            if m:
+                size = float(m.group(1))
+                unit = m.group(2).lower()
+                mult = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
+                result["size_added"] = int(size * mult.get(unit, 1))
+
+            starts = re.findall(r"Backup (?:started|finished) at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", content)
+            if len(starts) >= 2:
+                try:
+                    t0 = datetime.strptime(starts[0], "%Y-%m-%d %H:%M:%S")
+                    t1 = datetime.strptime(starts[-1], "%Y-%m-%d %H:%M:%S")
+                    result["duration_secs"] = max(0, int((t1 - t0).total_seconds()))
+                except ValueError:
+                    pass
+            elif re.search(r"in (\d+):(\d+)", content):
+                m = re.search(r"in (\d+):(\d+)", content)
+                result["duration_secs"] = int(m.group(1)) * 60 + int(m.group(2))
+
+            m = re.search(r"keep (\d+) snapshots:", content)
+            if m:
+                result["raw"]["snapshots_kept"] = int(m.group(1))
+
+            m = re.search(r"snapshot ([a-f0-9]{8,}) saved", content)
+            if m:
+                result["raw"]["snapshot_id"] = m.group(1)
+
+            return result if result["status"] != "unknown" else None
+
+        def extract_repo_name(filepath):
+            name = Path(filepath).stem
+            name = re.sub(r"-\d{8}-\d{6}$", "", name)
+            return name if name != "restic-backup" else "default"
+
+        def extract_repo_from_content(content):
+            m = re.search(r"Repository:\s+\S+[:/](\S+)\s*$", content, re.MULTILINE)
+            if m:
+                return m.group(1).rstrip("/").split("/")[-1]
+            return None
+
+        def extract_timestamp(filepath, content):
+            m = re.search(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})", filepath)
+            if m:
+                return f"{m.group(1)}-{m.group(2)}-{m.group(3)}T{m.group(4)}:{m.group(5)}:{m.group(6)}Z"
+            m = re.search(r"Backup started at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", content)
+            if m:
+                return m.group(1).replace(" ", "T") + "Z"
+            m = re.search(r"\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})", content)
+            if m:
+                return m.group(1).replace(" ", "T") + "Z"
+            return None
+
+        dated_files = [f for f in LOG_FILES if re.search(r"\d{8}-\d{6}\.log$", f)]
+        rollup_files = [f for f in LOG_FILES if not re.search(r"\d{8}-\d{6}\.log$", f)]
+        files_to_parse = dated_files if dated_files else rollup_files
+
+        posted = 0
+        skipped = 0
+        for logfile in files_to_parse:
+            try:
+                content = Path(logfile).read_text(errors="replace")
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+
+            if "[OK] CMDB post: http=200" in content:
+                skipped += 1
+                continue
+
+            result = parse_json_log(content) or parse_text_log(content)
+            if not result:
+                continue
+
+            started_at = extract_timestamp(logfile, content)
+            repo_name = extract_repo_from_content(content) or extract_repo_name(logfile)
+
+            payload = {
+                "hostname": HOSTNAME,
+                "repo_name": repo_name,
+                "source": "log_scan",
+                "started_at": started_at,
+                **{k: v for k, v in result.items() if k != "raw"},
+                "raw": result.get("raw", {}),
+            }
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"{CMDB_API}/api/v1/backup/report",
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {CMDB_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    posted += 1
+            except Exception as e:
+                print(f"WARN: POST failed for {logfile}: {e}", file=sys.stderr)
+
+        print(f"Parsed {len(files_to_parse)} log files, posted {posted}, skipped {skipped} (already posted by script)")
+        PYEOF
+      environment:
+        CMDB_API: "{{ cmdb_api }}"
+        CMDB_TOKEN: "{{ cmdb_token }}"
+        CMDB_HOSTNAME: "{{ inventory_hostname }}"
+        LOG_FILES_JSON: "{{ log_files.files | default([]) | map(attribute='path') | list | to_json }}"
+      register: parse_result
+      changed_when: false
+      when: log_files.files | default([]) | length > 0
+      delegate_to: localhost
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ parse_result.stdout | default('No log files found') }}"

@@ -1,0 +1,156 @@
+---
+# CMDB — collecte inventaire (serveurs + workstations)
+# Supporte: Debian, Ubuntu, Arch, Rocky, CentOS, RHEL, Fedora, AIX
+
+- name: Calculer les types du node (un node peut avoir plusieurs types)
+  ansible.builtin.set_fact:
+    node_types: >-
+      {{ type_groups | select('in', group_names) | list | default(['vm'], true) }}
+
+# ── Installer lshw si absent ───────────────────────────────
+- name: Installer lshw (apt)
+  ansible.builtin.apt:
+    name: lshw
+    state: present
+  when: ansible_pkg_mgr == "apt"
+  become: true
+  ignore_errors: true
+
+- name: Installer lshw (pacman)
+  ansible.builtin.pacman:
+    name: lshw
+    state: present
+  when: ansible_pkg_mgr == "pacman"
+  become: true
+  ignore_errors: true
+
+- name: Installer lshw (dnf)
+  ansible.builtin.dnf:
+    name: lshw
+    state: present
+  when: ansible_pkg_mgr == "dnf"
+  become: true
+  ignore_errors: true
+
+- name: Installer lshw (yum)
+  ansible.builtin.yum:
+    name: lshw
+    state: present
+  when: ansible_pkg_mgr == "yum"
+  become: true
+  ignore_errors: true
+
+# ── Collecte systeme ───────────────────────────────────────
+- name: Lire /etc/os-release
+  ansible.builtin.slurp:
+    src: /etc/os-release
+  register: os_release_raw
+  ignore_errors: true
+
+- name: Hardware via lshw (JSON)
+  ansible.builtin.command: lshw -json
+  register: hw_info_raw
+  become: true
+  ignore_errors: true
+  changed_when: false
+
+- name: Kernel
+  ansible.builtin.command: uname -r
+  register: kernel_ver
+  changed_when: false
+
+# ── Paquets ────────────────────────────────────────────────
+- name: Paquets apt (Debian/Ubuntu)
+  ansible.builtin.command: dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n'
+  register: pkgs_apt
+  when: ansible_pkg_mgr == "apt"
+  changed_when: false
+
+- name: Paquets pacman (Arch/Manjaro)
+  ansible.builtin.command: pacman -Q
+  register: pkgs_pacman
+  when: ansible_pkg_mgr == "pacman"
+  changed_when: false
+
+- name: Paquets rpm (RHEL/Rocky/CentOS/Fedora)
+  ansible.builtin.command: rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n'
+  register: pkgs_rpm
+  when: ansible_pkg_mgr in ("dnf", "yum")
+  changed_when: false
+
+- name: Paquets AIX (lslpp)
+  ansible.builtin.shell: lslpp -Lc 2>/dev/null | awk -F':' 'NR>1 {print $2"\t"$3"\t"$5}'
+  register: pkgs_aix
+  when: ansible_system == "AIX"
+  changed_when: false
+  ignore_errors: true
+
+# ── Containers Docker (si applicable) ──────────────────────
+- name: Containers Docker (inspect)
+  ansible.builtin.shell: |
+    docker ps -aq | xargs -r docker inspect 2>/dev/null | python3 -c "
+    import sys, json
+    data = json.load(sys.stdin)
+    for c in data:
+        name = c.get('Name', '').lstrip('/')
+        cfg = c.get('Config', {})
+        img = cfg.get('Image', '')
+        state = c.get('State', {})
+        status = state.get('Status', '')
+        if state.get('Running'):
+            status = 'Up'
+        net_settings = c.get('NetworkSettings', {})
+        networks = list((net_settings.get('Networks') or {}).keys())
+        ports_raw = net_settings.get('Ports') or {}
+        port_bindings = []
+        for port, bindings in ports_raw.items():
+            if bindings:
+                for b in bindings:
+                    port_bindings.append({
+                        'container_port': port,
+                        'host_ip': b.get('HostIp', ''),
+                        'host_port': b.get('HostPort', '')
+                    })
+        labels = cfg.get('Labels') or {}
+        print(json.dumps({
+            'name': name,
+            'image': img,
+            'status': status,
+            'digest': c.get('Image', ''),
+            'networks': networks,
+            'port_bindings': port_bindings,
+            'labels': labels,
+        }))
+    "
+  register: docker_containers
+  become: true
+  ignore_errors: true
+  changed_when: false
+  when: "'container_host' in group_names"
+
+# ── Push vers CMDB API ────────────────────────────────────
+- name: Push vers API CMDB
+  ansible.builtin.uri:
+    url: "{{ cmdb_api_url }}/api/v1/nodes/report"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ cmdb_api_token }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      hostname: "{{ inventory_hostname }}"
+      type: "{{ node_types }}"
+      os: "{{ ansible_distribution | lower }}"
+      os_version: "{{ ansible_distribution_version }}"
+      arch: "{{ ansible_architecture }}"
+      kernel: "{{ kernel_ver.stdout }}"
+      ip_address: "{{ ansible_default_ipv4.address | default(ansible_host | default('')) }}"
+      os_raw: "{{ (os_release_raw.content | default('') | b64decode) if os_release_raw is defined and os_release_raw is not failed else '' }}"
+      hw_info: >-
+        {{ (hw_info_raw.stdout | default('{}'))
+           if hw_info_raw is defined and hw_info_raw.rc == 0
+           else '{}' }}
+      packages: "{{ (pkgs_apt.stdout_lines | default([])) + (pkgs_pacman.stdout_lines | default([])) + (pkgs_rpm.stdout_lines | default([])) + (pkgs_aix.stdout_lines | default([])) }}"
+      containers: "{{ docker_containers.stdout_lines | default([]) }}"
+    status_code: [200, 201]
+    timeout: 30

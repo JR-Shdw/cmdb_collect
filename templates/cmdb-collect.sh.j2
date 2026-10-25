@@ -1,0 +1,68 @@
+#!/bin/sh
+# CMDB — Forced command wrapper for cmdb-collect
+# Deployed by bootstrap_access.yml — do not edit manually
+#
+# This script runs as cmdb-collect (unprivileged user).
+# SSH forced command: only commands listed here are allowed.
+# Any other SSH_ORIGINAL_COMMAND is denied.
+#
+# NOTE: No Docker commands here. Docker socket = root equivalent.
+# All Docker operations go through cmdb-scan.sh (root forced command).
+set -eu
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+
+  # ── OS info ──────────────────────────────────────────────
+  os-release)
+    cat /etc/os-release 2>/dev/null || cat /etc/redhat-release 2>/dev/null || echo "unknown"
+    ;;
+
+  kernel)
+    uname -r
+    ;;
+
+  uptime)
+    uptime
+    ;;
+
+  # ── Package listing ──────────────────────────────────────
+  packages)
+    if command -v dpkg-query >/dev/null 2>&1; then
+      dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n'
+    elif command -v rpm >/dev/null 2>&1; then
+      rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n'
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Q
+    elif command -v lslpp >/dev/null 2>&1; then
+      lslpp -Lc 2>/dev/null | awk -F':' 'NR>1 {print $2"\t"$3"\t"$5}'
+    else
+      echo "no_package_manager"
+    fi
+    ;;
+
+  # ── Full collect (all-in-one for Ansible) ────────────────
+  collect)
+    echo "=== OS_RELEASE ==="
+    cat /etc/os-release 2>/dev/null || cat /etc/redhat-release 2>/dev/null || echo "unknown"
+    echo "=== KERNEL ==="
+    uname -r
+    echo "=== ARCH ==="
+    uname -m
+    echo "=== PACKAGES ==="
+    if command -v dpkg-query >/dev/null 2>&1; then
+      dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n'
+    elif command -v rpm >/dev/null 2>&1; then
+      rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n'
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Q
+    elif command -v lslpp >/dev/null 2>&1; then
+      lslpp -Lc 2>/dev/null | awk -F':' 'NR>1 {print $2"\t"$3"\t"$5}'
+    fi
+    ;;
+
+  # ── Deny everything else ─────────────────────────────────
+  *)
+    echo "denied: ${SSH_ORIGINAL_COMMAND:-empty}" >&2
+    exit 1
+    ;;
+esac

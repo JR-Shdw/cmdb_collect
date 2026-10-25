@@ -1,0 +1,66 @@
+---
+# CMDB — Installation de Trivy sur les hotes
+# Telecharge le binaire statique depuis GitHub
+#
+# Usage: ansible-playbook -i inventory/hosts.ini playbooks/install_trivy.yml
+# Update: ansible-playbook -i inventory/hosts.ini playbooks/install_trivy.yml -e trivy_version=0.70.0
+#
+# Trivy est utilise en mode client → se connecte au server obs_stack (10.0.1.1:4954)
+
+- name: CMDB — Install Trivy binary
+  hosts: all:!workstation
+  gather_facts: true
+  become: true
+
+  vars:
+    trivy_version: "0.70.0"
+    trivy_arch_map:
+      x86_64: "64bit"
+      aarch64: "ARM64"
+    trivy_arch: "{{ trivy_arch_map[ansible_architecture] | default('64bit') }}"
+    trivy_url: "https://github.com/aquasecurity/trivy/releases/download/v{{ trivy_version }}/trivy_{{ trivy_version }}_Linux-{{ trivy_arch }}.tar.gz"
+    trivy_bin: "/usr/local/bin/trivy"
+
+  tasks:
+    - name: Check current trivy version
+      ansible.builtin.command: "{{ trivy_bin }} --version"
+      register: trivy_current
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set trivy installed version
+      ansible.builtin.set_fact:
+        trivy_installed: "{{ trivy_current.stdout | default('') | regex_search('Version: ([0-9.]+)', '\\1') | default([''], true) | first }}"
+
+    - name: Install or update trivy
+      when: trivy_installed != trivy_version
+      block:
+        - name: Download trivy tarball
+          ansible.builtin.get_url:
+            url: "{{ trivy_url }}"
+            dest: "/tmp/trivy_{{ trivy_version }}.tar.gz"
+            mode: "0644"
+            timeout: 60
+
+        - name: Extract trivy binary
+          ansible.builtin.unarchive:
+            src: "/tmp/trivy_{{ trivy_version }}.tar.gz"
+            dest: /usr/local/bin/
+            remote_src: true
+            include:
+              - trivy
+            mode: "0755"
+
+        - name: Clean up tarball
+          ansible.builtin.file:
+            path: "/tmp/trivy_{{ trivy_version }}.tar.gz"
+            state: absent
+
+        - name: Verify installation
+          ansible.builtin.command: "{{ trivy_bin }} --version"
+          changed_when: false
+
+    - name: Trivy already at version {{ trivy_version }}
+      ansible.builtin.debug:
+        msg: "trivy {{ trivy_installed }} already installed on {{ inventory_hostname }}"
+      when: trivy_installed == trivy_version

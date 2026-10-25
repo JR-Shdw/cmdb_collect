@@ -1,0 +1,136 @@
+#!/bin/sh
+# CMDB — Forced command wrapper for cmdb-scan
+# Deployed by bootstrap_access.yml — do not edit manually
+#
+# This script runs as root (SSH forced command on root account).
+# Only trivy scans, lshw, and docker operations are allowed.
+# Any other SSH_ORIGINAL_COMMAND is denied.
+set -eu
+
+# Cache directory (auto-detect best location)
+CACHE_DIR="/root/.cache/trivy"
+for d in /data /srv /var/lib; do
+  if [ -d "$d" ]; then
+    avail=$(df --output=avail "$d" 2>/dev/null | tail -1 || echo 0)
+    if [ "${avail:-0}" -gt 2097152 ]; then
+      CACHE_DIR="$d/trivy-cache"
+      break
+    fi
+  fi
+done
+mkdir -p "$CACHE_DIR"
+
+TRIVY_SERVER="{{ trivy_server | default('http://10.0.1.1:4954') }}"
+TRIVY_TIMEOUT="{{ trivy_timeout | default('10m') }}"
+TRIVY_SEVERITY="{{ trivy_severity | default('CRITICAL,HIGH,MEDIUM') }}"
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+
+  # ── Hardware info ────────────────────────────────────────
+  lshw)
+    lshw -json 2>/dev/null || echo "{}"
+    ;;
+
+  # ── Trivy rootfs scan (host CVEs + secrets) ──────────────
+  trivy-rootfs)
+    # Detect Arch (no --ignore-unfixed for pacman)
+    UNFIXED_FLAG="--ignore-unfixed"
+    if command -v pacman >/dev/null 2>&1; then
+      UNFIXED_FLAG=""
+    fi
+    TMPDIR="$CACHE_DIR" trivy rootfs / \
+      --server "$TRIVY_SERVER" \
+      --cache-dir "$CACHE_DIR" \
+      --format json --scanners vuln,secret --quiet \
+      --severity "$TRIVY_SEVERITY" \
+      $UNFIXED_FLAG \
+      --pkg-types os \
+      --timeout "$TRIVY_TIMEOUT" \
+      --skip-dirs /var/lib/docker \
+      --skip-dirs /var/lib/containerd \
+      --skip-dirs /var/lib/containers \
+      --skip-dirs /data/docker \
+      --skip-dirs /data/container \
+      --skip-dirs /srv/docker \
+      --skip-dirs /proc --skip-dirs /sys \
+      --skip-dirs /snap --skip-dirs /var/cache \
+      --skip-dirs /var/tmp
+    ;;
+
+  # ── Trivy config scan (misconfigurations) ────────────────
+  trivy-config)
+    TMPDIR="$CACHE_DIR" trivy config / \
+      --cache-dir "$CACHE_DIR" \
+      --format json --quiet \
+      --timeout "$TRIVY_TIMEOUT" \
+      --skip-dirs /var/lib/docker \
+      --skip-dirs /var/lib/containerd \
+      --skip-dirs /var/lib/containers \
+      --skip-dirs /data/docker \
+      --skip-dirs /data/container \
+      --skip-dirs /srv/docker \
+      --skip-dirs /proc --skip-dirs /sys \
+      --skip-dirs /run --skip-dirs /tmp \
+      --skip-dirs /snap --skip-dirs /var/cache \
+      --skip-dirs /var/tmp
+    ;;
+
+  # ── Trivy image scan (single image) ─────────────────────
+  trivy-image\ *)
+    IMAGE="${SSH_ORIGINAL_COMMAND#trivy-image }"
+    # Sanitize: only allow image name chars (alphanum, /, :, -, ., _)
+    if echo "$IMAGE" | grep -qE '^[a-zA-Z0-9/_:.\-]+$'; then
+      TMPDIR="$CACHE_DIR" trivy image "$IMAGE" \
+        --server "$TRIVY_SERVER" \
+        --cache-dir "$CACHE_DIR" \
+        --format json --scanners vuln,secret --quiet \
+        --severity "$TRIVY_SEVERITY" \
+        --ignore-unfixed \
+        --timeout "$TRIVY_TIMEOUT"
+    else
+      echo "denied: invalid image name" >&2
+      exit 1
+    fi
+    ;;
+
+  # ── Docker container images list ─────────────────────────
+  docker-images)
+    docker ps --format '{{ '{{' }}.Image{{ '}}' }}' 2>/dev/null | sort -u || echo ""
+    ;;
+
+  # ── Docker inspect all containers ────────────────────────
+  docker-inspect)
+    docker ps -aq | xargs -r docker inspect 2>/dev/null || echo "[]"
+    ;;
+
+  # ── Trivy version check ─────────────────────────────────
+  trivy-version)
+    trivy --version 2>/dev/null || echo "not installed"
+    ;;
+
+  # ── GeoIP detection ─────────────────────────────────────
+  detect-geoip)
+    found=""
+    grep -rl 'geoip2\|geoip_country\|GeoIP' /etc/nginx/ 2>/dev/null && found="nginx "
+    iptables -L -n 2>/dev/null | grep -qi geoip && found="${found}iptables "
+    nft list ruleset 2>/dev/null | grep -qi geoip && found="${found}nftables "
+    echo "${found:-none}"
+    ;;
+
+  # ── Firewall detection ──────────────────────────────────
+  detect-firewall)
+    found=""
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active" && found="ufw "
+    iptables -L INPUT -n 2>/dev/null | grep -qE 'DROP|REJECT' && found="${found}iptables "
+    iptables -L DOCKER-USER -n 2>/dev/null | grep -qE 'DROP|REJECT' && found="${found}docker-user "
+    nft list ruleset 2>/dev/null | grep -qE 'drop|reject' && found="${found}nftables "
+    command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running && found="${found}firewalld "
+    echo "${found:-none}"
+    ;;
+
+  # ── Deny everything else ─────────────────────────────────
+  *)
+    echo "denied: ${SSH_ORIGINAL_COMMAND:-empty}" >&2
+    exit 1
+    ;;
+esac

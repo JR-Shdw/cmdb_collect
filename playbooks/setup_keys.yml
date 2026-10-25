@@ -1,0 +1,115 @@
+---
+# CMDB — Génération des clés SSH pour les utilisateurs CMDB
+#
+# Crée les paires de clés ed25519 si elles n'existent pas :
+#   - cmdb_collect_ed25519 : pour cmdb-collect (lecture inventaire)
+#   - cmdb_scan_ed25519    : pour cmdb-scan (trivy, docker, lshw)
+#
+# Optionnel : clés RSA 4096 pour CentOS 5/6 (legacy)
+#
+# Usage:
+#   ansible-playbook playbooks/setup_keys.yml
+#   ansible-playbook playbooks/setup_keys.yml -e generate_rsa=true
+#
+# Exécuter AVANT bootstrap_access.yml
+
+- name: CMDB — Setup SSH keys
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ssh_dir: "{{ lookup('env', 'HOME') }}/.ssh"
+    generate_rsa: false
+
+  tasks:
+    - name: Ensure ~/.ssh directory exists
+      ansible.builtin.file:
+        path: "{{ ssh_dir }}"
+        state: directory
+        mode: "0700"
+
+    # ── Clés ed25519 (standard) ────────────────────────────────
+    - name: Check cmdb_collect_ed25519 key exists
+      ansible.builtin.stat:
+        path: "{{ ssh_dir }}/cmdb_collect_ed25519"
+      register: collect_key
+
+    - name: Generate cmdb_collect_ed25519 key
+      ansible.builtin.command: >
+        ssh-keygen -t ed25519
+        -f {{ ssh_dir }}/cmdb_collect_ed25519
+        -C "cmdb-collect"
+        -N ""
+      when: not collect_key.stat.exists
+
+    - name: Check cmdb_scan_ed25519 key exists
+      ansible.builtin.stat:
+        path: "{{ ssh_dir }}/cmdb_scan_ed25519"
+      register: scan_key
+
+    - name: Generate cmdb_scan_ed25519 key
+      ansible.builtin.command: >
+        ssh-keygen -t ed25519
+        -f {{ ssh_dir }}/cmdb_scan_ed25519
+        -C "cmdb-scan"
+        -N ""
+      when: not scan_key.stat.exists
+
+    # ── Clés RSA 4096 (legacy CentOS 5/6) ─────────────────────
+    - name: Check cmdb_collect_rsa key exists
+      ansible.builtin.stat:
+        path: "{{ ssh_dir }}/cmdb_collect_rsa"
+      register: collect_rsa_key
+      when: generate_rsa | bool
+
+    - name: Generate cmdb_collect_rsa key
+      ansible.builtin.command: >
+        ssh-keygen -t rsa -b 4096
+        -f {{ ssh_dir }}/cmdb_collect_rsa
+        -C "cmdb-collect-legacy"
+        -N ""
+      when:
+        - generate_rsa | bool
+        - not collect_rsa_key.stat.exists
+
+    - name: Check cmdb_scan_rsa key exists
+      ansible.builtin.stat:
+        path: "{{ ssh_dir }}/cmdb_scan_rsa"
+      register: scan_rsa_key
+      when: generate_rsa | bool
+
+    - name: Generate cmdb_scan_rsa key
+      ansible.builtin.command: >
+        ssh-keygen -t rsa -b 4096
+        -f {{ ssh_dir }}/cmdb_scan_rsa
+        -C "cmdb-scan-legacy"
+        -N ""
+      when:
+        - generate_rsa | bool
+        - not scan_rsa_key.stat.exists
+
+    # ── Permissions ────────────────────────────────────────────
+    - name: Set correct permissions on private keys
+      ansible.builtin.file:
+        path: "{{ ssh_dir }}/{{ item }}"
+        mode: "0600"
+      loop:
+        - cmdb_collect_ed25519
+        - cmdb_scan_ed25519
+      when: not collect_key.stat.exists or not scan_key.stat.exists
+
+    # ── Summary ────────────────────────────────────────────────
+    - name: Show public keys
+      ansible.builtin.debug:
+        msg: |
+          SSH keys ready in {{ ssh_dir }}/:
+
+          ── cmdb-collect (inventaire, sans privilège) ──
+          {{ lookup('file', ssh_dir + '/cmdb_collect_ed25519.pub') }}
+
+          ── cmdb-scan (trivy/docker, root forced command) ──
+          {{ lookup('file', ssh_dir + '/cmdb_scan_ed25519.pub') }}
+
+          Next step:
+            ansible-playbook -i inventory/hosts.ini playbooks/bootstrap_access.yml

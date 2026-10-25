@@ -1,0 +1,138 @@
+---
+# CMDB — Rotate per-node collect tokens
+#
+# Regenerates tokens for all (or specific) nodes.
+# Use for scheduled rotation or after suspected compromise.
+# Old token is immediately invalidated, new one stored in vault.
+#
+# Usage:
+#   # Rotate all node tokens
+#   ansible-playbook -i inventory/hosts.ini playbooks/rotate_tokens.yml \
+#     --ask-vault-pass
+#
+#   # Rotate with new expiration (24h)
+#   ansible-playbook -i inventory/hosts.ini playbooks/rotate_tokens.yml \
+#     -e token_ttl_hours=24 --ask-vault-pass
+#
+#   # Rotate single node
+#   ansible-playbook -i inventory/hosts.ini playbooks/rotate_tokens.yml \
+#     -e target_node=vega --ask-vault-pass
+#
+# Can be scheduled via CMDB scheduler (http_request job type)
+# or cron for periodic rotation.
+
+- name: CMDB — Rotate node tokens
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    cmdb_api: "http://{{ cmdb_api_ip | default('10.0.1.1') }}:8000"
+    cmdb_admin_token: "{{ cmdb_secret_key }}"
+    target_node: ""
+    token_ttl_hours: 0
+    host_vars_dir: "{{ playbook_dir }}/../inventory/host_vars"
+
+  tasks:
+    # ── Fetch existing tokens ──────────────────────────────
+    - name: Fetch all CMDB tokens
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        return_content: true
+      register: all_tokens
+
+    - name: Filter node tokens to rotate
+      ansible.builtin.set_fact:
+        tokens_to_rotate: >-
+          {{ all_tokens.json.items | default([])
+             | selectattr('name', 'match', '^node-')
+             | selectattr('active')
+             | list }}
+
+    - name: Filter to single node if specified
+      ansible.builtin.set_fact:
+        tokens_to_rotate: >-
+          {{ tokens_to_rotate | selectattr('name', 'equalto', 'node-' + target_node) | list }}
+      when: target_node | length > 0
+
+    - name: Show tokens to rotate
+      ansible.builtin.debug:
+        msg: "Rotating {{ tokens_to_rotate | length }} token(s): {{ tokens_to_rotate | map(attribute='name') | list }}"
+
+    # ── Regenerate each token ──────────────────────────────
+    - name: Regenerate token
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens/{{ item.id }}/regenerate"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+        return_content: true
+        status_code: [200]
+      loop: "{{ tokens_to_rotate }}"
+      register: regenerated_tokens
+
+    # ── Update expiration if TTL set ───────────────────────
+    - name: Update token expiration
+      ansible.builtin.uri:
+        url: "{{ cmdb_api }}/api/v1/tokens/{{ item.item.id }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ cmdb_admin_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          expires_at: >-
+            {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(ansible_date_time.epoch | int + (token_ttl_hours | int * 3600)) }}
+      loop: "{{ regenerated_tokens.results }}"
+      when:
+        - token_ttl_hours | int > 0
+        - item.json is defined
+
+    # ── Store new tokens in vault ──────────────────────────
+    - name: Ensure host_vars directory exists
+      ansible.builtin.file:
+        path: "{{ host_vars_dir }}/{{ item.item.name | replace('node-', '') }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ regenerated_tokens.results }}"
+      when: item.json is defined
+
+    - name: Write new token to vault
+      ansible.builtin.copy:
+        content: |
+          ---
+          # CMDB collect token for {{ item.item.name | replace('node-', '') }}
+          # Rotated by rotate_tokens.yml — do not edit
+          # Token ID: {{ item.item.id }}
+          # Rotated at: {{ ansible_date_time.iso8601 }}
+          # Expires: {{ 'in ' + (token_ttl_hours | string) + 'h' if (token_ttl_hours | int > 0) else 'never' }}
+          cmdb_api_token: "{{ item.json.token }}"
+        dest: "{{ host_vars_dir }}/{{ item.item.name | replace('node-', '') }}/vault.yml"
+        mode: "0600"
+      loop: "{{ regenerated_tokens.results }}"
+      when: item.json is defined
+
+    - name: Encrypt vault files
+      ansible.builtin.command: >
+        ansible-vault encrypt
+        {{ host_vars_dir }}/{{ item.item.name | replace('node-', '') }}/vault.yml
+      loop: "{{ regenerated_tokens.results }}"
+      when: item.json is defined
+      changed_when: true
+
+    # ── Summary ────────────────────────────────────────────
+    - name: Rotation summary
+      ansible.builtin.debug:
+        msg: |
+          Rotated {{ regenerated_tokens.results | length }} token(s):
+          {% for r in regenerated_tokens.results %}
+          - {{ r.item.name }}: {{ r.json.token_hint | default('error') }}
+          {% endfor %}
+          {% if token_ttl_hours | int > 0 %}
+          TTL: {{ token_ttl_hours }}h — tokens will expire automatically.
+          {% else %}
+          Tokens are permanent. Schedule rotation with cron or CMDB scheduler.
+          {% endif %}
